@@ -30,6 +30,10 @@ public:
         Interleaved
     };
 
+    struct NALUnit {
+        std::vector<uint8_t> data;
+    };
+
     // H.264 packetizer settings
     struct Config {
         int nMTU;
@@ -46,6 +50,12 @@ public:
 
     // Append RTP payload to a H.264 picture bitstream
     Status Unpacketize(const uint8_t *pPayload, size_t nPayloadLen, uint8_t *pBits, size_t nBitsLen, unsigned *pBitsPos);
+
+    // Repacketize H.264 buffer
+    std::vector<NALUnit> Repacketize(const uint8_t *pBuffer, size_t nLength);
+
+    // Convert H624 packetization mode from 1 to 0
+    std::vector<H264Packetizer::NALUnit> ConvertMode(const uint8_t* pPayload, size_t nPayloadLength);
 
 private:
     // Enumeration of H.264 NAL unit types

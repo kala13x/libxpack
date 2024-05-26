@@ -27,7 +27,7 @@ H264Packetizer::Status H264Packetizer::Packetize(uint8_t *pBuffer, size_t nBufLe
     uint8_t *pEnd = pBuffer + nBufLen;
     uint8_t *pNALStart = nullptr;
     uint8_t *pNALEnd = nullptr;
-    uint8_t *pNALObj = nullptr;
+    uint8_t *pNALOctet = nullptr;
 
     if (pEnd - pOffset >= 4)
         pNALStart = FindNextNAL(pOffset, pOffset + 4);
@@ -40,7 +40,7 @@ H264Packetizer::Status H264Packetizer::Packetize(uint8_t *pBuffer, size_t nBufLe
     else
     {
         while (*pNALStart++ == 0);
-        pNALObj = pNALStart;
+        pNALOctet = pNALStart;
     }
 
     pOffset = pNALStart + m_cfg.nMTU + 1;
@@ -55,14 +55,14 @@ H264Packetizer::Status H264Packetizer::Packetize(uint8_t *pBuffer, size_t nBufLe
         return Small;
     }
 
-    if ((m_cfg.mode != SingleNAL) && (!pNALObj || pNALEnd - pNALStart > m_cfg.nMTU))
+    if ((m_cfg.mode != SingleNAL) && (!pNALOctet || pNALEnd - pNALStart > m_cfg.nMTU))
     {
         uint8_t nNRI, nType;
 
-        if (pNALObj)
+        if (pNALOctet)
         {
-            nNRI = (*pNALObj & 0x60) >> 5;
-            nType = *pNALObj & 0x1F;
+            nNRI = (*pNALOctet & 0x60) >> 5;
+            nType = *pNALOctet & 0x1F;
             ++pNALStart;
         }
         else
@@ -77,7 +77,7 @@ H264Packetizer::Status H264Packetizer::Packetize(uint8_t *pBuffer, size_t nBufLe
         ++pOffset;
 
         *pOffset = nType;
-        if (pNALObj) *pOffset |= (1 << 7);
+        if (pNALOctet) *pOffset |= (1 << 7);
         if (pNALEnd - pNALStart + 2 <= m_cfg.nMTU) *pOffset |= (1 << 6);
 
         *ppPayload = pNALStart - 2;
@@ -98,7 +98,7 @@ H264Packetizer::Status H264Packetizer::Packetize(uint8_t *pBuffer, size_t nBufLe
         nNALSize[0] = pNALEnd - pNALStart;
 
         int nTotalSize = static_cast<int>(nNALSize[0]) + 3;
-        uint8_t nNRI = (*pNALObj & 0x60) >> 5;
+        uint8_t nNRI = (*pNALOctet & 0x60) >> 5;
 
         while (nNALCount < 32)
         {
@@ -266,9 +266,119 @@ H264Packetizer::Status H264Packetizer::Unpacketize(const uint8_t *pPayload, size
     else
     {
         *pBitsPos = 0;
-        return Unsupported;
+        return H264Packetizer::Unsupported;
     }
 
     m_unpackPrevLost = false;
-    return Success;
+    return H264Packetizer::Success;
+}
+
+std::vector<H264Packetizer::NALUnit> H264Packetizer::Repacketize(const uint8_t* pBuffer, size_t nLength)
+{
+    std::vector<NALUnit> nalUnits;
+    size_t nPosit = 0;
+
+    while (nPosit < nLength)
+    {
+        const uint8_t *pNALStart = nullptr;
+        const uint8_t *pNALEnd = nullptr;
+        const uint8_t *pPos = pBuffer + nPosit;
+        const uint8_t *pEnd = pBuffer + nLength;
+
+        if (pEnd - pPos >= 4)
+        {
+            uint8_t *pOffset = const_cast<uint8_t*>(pPos);
+            pNALStart = FindNextNAL(pOffset, pOffset + 4);
+        }
+
+        if (pNALStart) while (*pNALStart++ == 0);
+        else pNALStart = pPos;
+
+        pPos = pNALStart + m_cfg.nMTU + 1;
+        if (pPos > pEnd || m_cfg.mode == SingleNAL) pPos = pEnd;
+
+        pNALEnd = FindNextNAL(const_cast<uint8_t*>(pNALStart), const_cast<uint8_t*>(pPos));
+        if (!pNALEnd) pNALEnd = pPos;
+
+        NALUnit nalUnit;
+        nalUnit.data.assign(pNALStart, pNALEnd);
+        nalUnits.push_back(nalUnit);
+
+        nPosit = pNALEnd - pBuffer;
+    }
+
+    return nalUnits;
+}
+
+std::vector<H264Packetizer::NALUnit> H264Packetizer::ConvertMode(const uint8_t* pPayload, size_t nPayloadLength)
+{
+    std::vector<NALUnit> nalPackets;
+    size_t pPos = 0;
+
+    while (pPos < nPayloadLength)
+    {
+        uint8_t nNALType = pPayload[pPos] & 0x1F;
+
+        if (nNALType == STAP_A)
+        {
+            // STAP-A: single-time aggregation packet
+            pPos++; // Skip the STAP-A header
+
+            while (pPos < nPayloadLength)
+            {
+                uint16_t nNALSize = (pPayload[pPos] << 8) | pPayload[pPos + 1];
+                pPos += 2;
+
+                NALUnit nalUnit;
+                nalUnit.data.assign(pPayload + pPos, pPayload + pPos + nNALSize);
+
+                nalPackets.push_back(nalUnit);
+                pPos += nNALSize;
+            }
+        }
+        else if (nNALType == FU_A)
+        {
+            // FU-A: fragmented NAL unit
+            uint8_t nNRI = (pPayload[pPos] & 0x60) >> 5;
+            uint8_t nOrigNALType = pPayload[pPos + 1] & 0x1F;
+            pPos += 2; // Skip the FU-A header
+
+            NALUnit nalUnit;
+            nalUnit.data.push_back((nNRI << 5) | nOrigNALType);
+
+            while (pPos < nPayloadLength)
+            {
+                uint8_t nFUHeader = pPayload[pPos - 1];
+                const uint8_t *pStart = pPayload + pPos;
+                const uint8_t *pEnd = pStart + m_cfg.nMTU - 2;
+
+                nalUnit.data.insert(nalUnit.data.end(), pPayload + pPos, pEnd);
+                pPos += m_cfg.nMTU - 2;
+
+                if (nFUHeader & 0x40)
+                {
+                    // End of fragmented NAL unit
+                    nalPackets.push_back(nalUnit);
+                    break;
+                }
+            }
+        }
+        else
+        {
+            // Single NAL unit
+            const uint8_t *pNALStart = pPayload + pPos;
+            size_t nNALLen = std::min(nPayloadLength - pPos, (size_t)m_cfg.nMTU);
+
+            const uint8_t *pNALEnd = FindNextNAL(const_cast<uint8_t*>(pNALStart), const_cast<uint8_t*>(pNALStart) + nNALLen);
+            if (pNALEnd) nNALLen = pNALEnd - pNALStart;
+
+            NALUnit nalUnit;
+            nalUnit.data.assign(pNALStart, pNALStart + nNALLen);
+
+            nalPackets.push_back(nalUnit);
+            pPos += nNALLen;
+        }
+    }
+
+    return nalPackets;
 }
